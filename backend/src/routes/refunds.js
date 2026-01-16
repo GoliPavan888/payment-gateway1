@@ -121,4 +121,44 @@ router.post(
   }
 );
 
+/* =========================
+   GET REFUND (AUTH)
+   (ADDED — NO CHANGE TO ABOVE LOGIC)
+========================= */
+router.get("/:id", authenticateMerchant, async (req, res) => {
+  try {
+    const refundId = req.params.id;
+
+    const refunds = await sequelize.query(
+      `
+      SELECT *
+      FROM refunds
+      WHERE id = :id
+        AND merchant_id = :merchant_id
+      `,
+      {
+        replacements: {
+          id: refundId,
+          merchant_id: req.merchant.id
+        },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+
+    if (!refunds.length) {
+      return res.status(404).json({
+        error: {
+          code: "NOT_FOUND_ERROR",
+          description: "Refund not found"
+        }
+      });
+    }
+
+    return res.status(200).json(refunds[0]);
+  } catch (err) {
+    console.error("Get refund error:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
 module.exports = router;

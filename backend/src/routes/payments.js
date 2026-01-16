@@ -5,7 +5,7 @@ const { sequelize } = require("../db");
 const authenticateMerchant = require("../middleware/auth");
 const { generatePaymentId } = require("../utils/idGenerator");
 const { validateVPA } = require("../utils/validation");
-const paymentQueue = require("../queue/paymentQueue");
+const { paymentQueue } = require("../queue/paymentQueue");
 
 /* =========================
    CREATE PAYMENT (AUTH)
@@ -14,9 +14,42 @@ router.post("/", authenticateMerchant, async (req, res) => {
   try {
     const { order_id, method, vpa } = req.body;
 
+    /* =========================
+       IDEMPOTENCY CHECK (FIRST)
+    ========================= */
+    const idempotencyKey = req.headers["idempotency-key"];
+
+    if (idempotencyKey) {
+      const [rows] = await sequelize.query(
+        `
+        SELECT response
+        FROM idempotency_keys
+        WHERE key = :key
+          AND merchant_id = :merchant_id
+          AND expires_at > NOW()
+        LIMIT 1
+        `,
+        {
+          replacements: {
+            key: idempotencyKey,
+            merchant_id: req.merchant.id
+          }
+        }
+      );
+
+      if (rows.length > 0) {
+        return res.status(201).json(rows[0].response);
+      }
+    }
+
     // 1. Fetch order
     const [orders] = await sequelize.query(
-      `SELECT * FROM orders WHERE id = :order_id AND merchant_id = :merchant_id`,
+      `
+      SELECT *
+      FROM orders
+      WHERE id = :order_id
+        AND merchant_id = :merchant_id
+      `,
       {
         replacements: {
           order_id,
@@ -45,9 +78,9 @@ router.post("/", authenticateMerchant, async (req, res) => {
     await sequelize.query(
       `
       INSERT INTO payments (
-        id, order_id, merchant_id, amount, currency, method, status, vpa
+        id, order_id, merchant_id, amount, currency, method, status, vpa, captured
       ) VALUES (
-        :id, :order_id, :merchant_id, :amount, :currency, :method, 'pending', :vpa
+        :id, :order_id, :merchant_id, :amount, :currency, :method, 'pending', :vpa, false
       )
       `,
       {
@@ -63,13 +96,10 @@ router.post("/", authenticateMerchant, async (req, res) => {
       }
     );
 
-    // 4. Enqueue async payment job
-    await paymentQueue.add("process-payment", {
-      paymentId
-    });
+    // 4. Enqueue async job
+    await paymentQueue.add("process-payment", { paymentId });
 
-    // 5. Return immediately
-    res.status(201).json({
+    const responsePayload = {
       id: paymentId,
       order_id,
       amount: order.amount,
@@ -77,11 +107,111 @@ router.post("/", authenticateMerchant, async (req, res) => {
       method,
       status: "pending",
       created_at: new Date().toISOString()
-    });
+    };
+
+    /* =========================
+       SAVE IDEMPOTENCY RESPONSE
+    ========================= */
+    if (idempotencyKey) {
+      await sequelize.query(
+        `
+        INSERT INTO idempotency_keys (key, merchant_id, response, expires_at)
+        VALUES (:key, :merchant_id, :response, NOW() + INTERVAL '24 hours')
+        ON CONFLICT (key, merchant_id) DO NOTHING
+        `,
+        {
+          replacements: {
+            key: idempotencyKey,
+            merchant_id: req.merchant.id,
+            response: JSON.stringify(responsePayload)
+          }
+        }
+      );
+    }
+
+    return res.status(201).json(responsePayload);
 
   } catch (err) {
     console.error("Create payment error:", err);
-    res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/* =========================
+   CAPTURE PAYMENT (AUTH)
+========================= */
+router.post("/:id/capture", authenticateMerchant, async (req, res) => {
+  try {
+    const paymentId = req.params.id;
+
+    const [rows] = await sequelize.query(
+      `
+      SELECT *
+      FROM payments
+      WHERE id = :id
+        AND merchant_id = :merchant_id
+      `,
+      {
+        replacements: {
+          id: paymentId,
+          merchant_id: req.merchant.id
+        }
+      }
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        error: { code: "NOT_FOUND_ERROR", description: "Payment not found" }
+      });
+    }
+
+    const payment = rows[0];
+
+    if (payment.status !== "success") {
+      return res.status(400).json({
+        error: {
+          code: "BAD_REQUEST_ERROR",
+          description: "Payment not in capturable state"
+        }
+      });
+    }
+
+    if (payment.captured === true) {
+      return res.status(400).json({
+        error: {
+          code: "BAD_REQUEST_ERROR",
+          description: "Payment already captured"
+        }
+      });
+    }
+
+    await sequelize.query(
+      `
+      UPDATE payments
+      SET captured = true,
+          updated_at = NOW()
+      WHERE id = :id
+      `,
+      {
+        replacements: { id: paymentId }
+      }
+    );
+
+    return res.status(200).json({
+      id: payment.id,
+      order_id: payment.order_id,
+      amount: payment.amount,
+      currency: payment.currency,
+      method: payment.method,
+      status: payment.status,
+      captured: true,
+      created_at: payment.created_at,
+      updated_at: new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error("Capture payment error:", err);
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 
@@ -94,7 +224,8 @@ router.get("/:id", authenticateMerchant, async (req, res) => {
       `
       SELECT *
       FROM payments
-      WHERE id = :id AND merchant_id = :merchant_id
+      WHERE id = :id
+        AND merchant_id = :merchant_id
       `,
       {
         replacements: {
@@ -110,10 +241,10 @@ router.get("/:id", authenticateMerchant, async (req, res) => {
       });
     }
 
-    res.json(rows[0]);
+    return res.json(rows[0]);
   } catch (err) {
     console.error("Get payment error:", err);
-    res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 
@@ -147,9 +278,9 @@ router.post("/public", async (req, res) => {
     await sequelize.query(
       `
       INSERT INTO payments (
-        id, order_id, merchant_id, amount, currency, method, status, vpa
+        id, order_id, merchant_id, amount, currency, method, status, vpa, captured
       ) VALUES (
-        :id, :order_id, :merchant_id, :amount, :currency, :method, 'pending', :vpa
+        :id, :order_id, :merchant_id, :amount, :currency, :method, 'pending', :vpa, false
       )
       `,
       {
@@ -165,12 +296,9 @@ router.post("/public", async (req, res) => {
       }
     );
 
-    // Enqueue async job
-    await paymentQueue.add("process-payment", {
-      paymentId
-    });
+    await paymentQueue.add("process-payment", { paymentId });
 
-    res.status(201).json({
+    return res.status(201).json({
       id: paymentId,
       order_id,
       amount: order.amount,
@@ -182,7 +310,7 @@ router.post("/public", async (req, res) => {
 
   } catch (err) {
     console.error("Public payment error:", err);
-    res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 
@@ -201,7 +329,7 @@ router.get("/:id/public", async (req, res) => {
     });
   }
 
-  res.json(rows[0]);
+  return res.json(rows[0]);
 });
 
 /* =========================
@@ -218,6 +346,7 @@ router.get("/", authenticateMerchant, async (req, res) => {
         currency,
         method,
         status,
+        captured,
         created_at
       FROM payments
       WHERE merchant_id = :merchant_id
@@ -230,13 +359,13 @@ router.get("/", authenticateMerchant, async (req, res) => {
       }
     );
 
-    res.json({
+    return res.json({
       count: rows.length,
       items: rows
     });
   } catch (err) {
     console.error("List payments error:", err);
-    res.status(500).json({ error: "Internal error" });
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 

@@ -7,4 +7,5 @@ const paymentQueue = new Queue("payment-processing", {
   }
 });
 
-module.exports = paymentQueue;
+module.exports = { paymentQueue };
+
