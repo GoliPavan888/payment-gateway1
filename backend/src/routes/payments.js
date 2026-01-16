@@ -5,6 +5,7 @@ const { sequelize } = require("../db");
 const authenticateMerchant = require("../middleware/auth");
 const { generatePaymentId } = require("../utils/idGenerator");
 const { validateVPA } = require("../utils/validation");
+const paymentQueue = require("../queue/paymentQueue");
 
 /* =========================
    CREATE PAYMENT (AUTH)
@@ -13,6 +14,7 @@ router.post("/", authenticateMerchant, async (req, res) => {
   try {
     const { order_id, method, vpa } = req.body;
 
+    // 1. Fetch order
     const [orders] = await sequelize.query(
       `SELECT * FROM orders WHERE id = :order_id AND merchant_id = :merchant_id`,
       {
@@ -29,6 +31,7 @@ router.post("/", authenticateMerchant, async (req, res) => {
       });
     }
 
+    // 2. Validate UPI
     if (method === "upi" && !validateVPA(vpa)) {
       return res.status(400).json({
         error: { code: "INVALID_VPA", description: "Invalid VPA" }
@@ -38,12 +41,13 @@ router.post("/", authenticateMerchant, async (req, res) => {
     const order = orders[0];
     const paymentId = generatePaymentId();
 
+    // 3. Insert payment (PENDING)
     await sequelize.query(
       `
       INSERT INTO payments (
         id, order_id, merchant_id, amount, currency, method, status, vpa
       ) VALUES (
-        :id, :order_id, :merchant_id, :amount, :currency, :method, 'processing', :vpa
+        :id, :order_id, :merchant_id, :amount, :currency, :method, 'pending', :vpa
       )
       `,
       {
@@ -59,46 +63,30 @@ router.post("/", authenticateMerchant, async (req, res) => {
       }
     );
 
-    // ✅ PAYMENT PROCESSING LOGIC (CRITICAL)
-    const delay = process.env.TEST_MODE === "true"
-      ? Number(process.env.TEST_PROCESSING_DELAY || 1000)
-      : Math.floor(Math.random() * 5000) + 5000;
+    // 4. Enqueue async payment job
+    await paymentQueue.add("process-payment", {
+      paymentId
+    });
 
-    const success =
-      process.env.TEST_MODE === "true"
-        ? process.env.TEST_PAYMENT_SUCCESS !== "false"
-        : Math.random() < 0.9;
-
-    setTimeout(async () => {
-      await sequelize.query(
-        `
-        UPDATE payments
-        SET status = :status, updated_at = NOW()
-        WHERE id = :id
-        `,
-        {
-          replacements: {
-            id: paymentId,
-            status: success ? "success" : "failed"
-          }
-        }
-      );
-    }, delay);
-
+    // 5. Return immediately
     res.status(201).json({
       id: paymentId,
-      status: "processing"
+      order_id,
+      amount: order.amount,
+      currency: order.currency,
+      method,
+      status: "pending",
+      created_at: new Date().toISOString()
     });
 
   } catch (err) {
-    console.error("Auth payment error:", err);
+    console.error("Create payment error:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
 
-
 /* =========================
-   GET PAYMENT (AUTH) ✅ REQUIRED
+   GET PAYMENT (AUTH)
 ========================= */
 router.get("/:id", authenticateMerchant, async (req, res) => {
   try {
@@ -111,14 +99,14 @@ router.get("/:id", authenticateMerchant, async (req, res) => {
       {
         replacements: {
           id: req.params.id,
-          merchant_id: req.merchant.id,
-        },
+          merchant_id: req.merchant.id
+        }
       }
     );
 
     if (!rows.length) {
       return res.status(404).json({
-        error: { code: "NOT_FOUND_ERROR", description: "Payment not found" },
+        error: { code: "NOT_FOUND_ERROR", description: "Payment not found" }
       });
     }
 
@@ -143,13 +131,13 @@ router.post("/public", async (req, res) => {
 
     if (!orders.length) {
       return res.status(404).json({
-        error: { code: "NOT_FOUND_ERROR", description: "Order not found" },
+        error: { code: "NOT_FOUND_ERROR", description: "Order not found" }
       });
     }
 
     if (method === "upi" && !validateVPA(vpa)) {
       return res.status(400).json({
-        error: { code: "INVALID_VPA", description: "Invalid VPA" },
+        error: { code: "INVALID_VPA", description: "Invalid VPA" }
       });
     }
 
@@ -161,7 +149,7 @@ router.post("/public", async (req, res) => {
       INSERT INTO payments (
         id, order_id, merchant_id, amount, currency, method, status, vpa
       ) VALUES (
-        :id, :order_id, :merchant_id, :amount, :currency, :method, 'processing', :vpa
+        :id, :order_id, :merchant_id, :amount, :currency, :method, 'pending', :vpa
       )
       `,
       {
@@ -172,17 +160,15 @@ router.post("/public", async (req, res) => {
           amount: order.amount,
           currency: order.currency,
           method,
-          vpa: vpa || null,
-        },
+          vpa: vpa || null
+        }
       }
     );
 
-    setTimeout(async () => {
-      await sequelize.query(
-        `UPDATE payments SET status = 'success' WHERE id = :id`,
-        { replacements: { id: paymentId } }
-      );
-    }, Number(process.env.TEST_PROCESSING_DELAY || 1000));
+    // Enqueue async job
+    await paymentQueue.add("process-payment", {
+      paymentId
+    });
 
     res.status(201).json({
       id: paymentId,
@@ -190,9 +176,10 @@ router.post("/public", async (req, res) => {
       amount: order.amount,
       currency: order.currency,
       method,
-      status: "processing",
-      created_at: new Date().toISOString(),
+      status: "pending",
+      created_at: new Date().toISOString()
     });
+
   } catch (err) {
     console.error("Public payment error:", err);
     res.status(500).json({ error: "Internal error" });
@@ -200,7 +187,7 @@ router.post("/public", async (req, res) => {
 });
 
 /* =========================
-   PUBLIC PAYMENT STATUS (CHECKOUT)
+   PUBLIC PAYMENT STATUS
 ========================= */
 router.get("/:id/public", async (req, res) => {
   const [rows] = await sequelize.query(
@@ -210,14 +197,15 @@ router.get("/:id/public", async (req, res) => {
 
   if (!rows.length) {
     return res.status(404).json({
-      error: { code: "NOT_FOUND_ERROR", description: "Payment not found" },
+      error: { code: "NOT_FOUND_ERROR", description: "Payment not found" }
     });
   }
 
   res.json(rows[0]);
 });
+
 /* =========================
-   LIST PAYMENTS (AUTH) ✅ REQUIRED
+   LIST PAYMENTS (AUTH)
 ========================= */
 router.get("/", authenticateMerchant, async (req, res) => {
   try {
@@ -237,20 +225,19 @@ router.get("/", authenticateMerchant, async (req, res) => {
       `,
       {
         replacements: {
-          merchant_id: req.merchant.id,
-        },
+          merchant_id: req.merchant.id
+        }
       }
     );
 
     res.json({
       count: rows.length,
-      items: rows,
+      items: rows
     });
   } catch (err) {
     console.error("List payments error:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });
-
 
 module.exports = router;

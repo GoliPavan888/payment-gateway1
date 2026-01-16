@@ -11,6 +11,7 @@ module.exports = (app) => {
 
   // Payments
   app.use("/api/v1/payments", paymentsRoutes);
+  app.use("/api/v1", require("./refunds"));
 
   // Test endpoints (REQUIRED FOR EVALUATION)
   app.use("/api/v1/test", testRoutes);
